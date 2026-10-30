@@ -1,0 +1,242 @@
+#include <Arduino.h>
+#include <math.h>
+#include <stdio.h>
+
+// GPIO assignments
+const int CURRENT_PIN = 34;
+const int LEFT_PWM = 18;
+const int RIGHT_PWM = 19;
+const int WARNING_LED = 23;
+
+// Optional direction outputs for real motor driver integration
+const int LEFT_DIR = 25;
+const int RIGHT_DIR = 26;
+
+// Timing
+const unsigned long FAST_PERIOD = 10;   // 100 Hz
+const unsigned long SLOW_PERIOD = 50;   // 20 Hz
+const unsigned long STALL_TIME = 350;
+const unsigned long POWER_REDUCE_TIME = 50;
+const unsigned long REVERSE_TIME = 200;
+
+// Rover settings
+const float TRACK_WIDTH = 0.4f;  // metres
+const float MAX_SPEED = 1.0f;    // m/s
+
+float forwardSpeed = 0.5f;       // m/s
+float turnRate = 0.0f;           // rad/s
+float currentA = 0;
+
+float leftCmd = 0;
+float rightCmd = 0;
+
+unsigned long lastFast = 0;
+unsigned long lastSlow = 0;
+unsigned long highCurrentStart = 0;
+unsigned long stateStart = 0;
+
+bool highCurrent = false;
+
+enum State {
+  NORMAL,
+  POWER_REDUCED,
+  REVERSING,
+  LOCKOUT
+};
+
+State state = NORMAL;
+
+String inputLine;
+
+// Interpret signed motor commands:
+// sign = direction, magnitude = PWM duty
+void setMotors(float left, float right) {
+  left = constrain(left, -1.0f, 1.0f);
+  right = constrain(right, -1.0f, 1.0f);
+
+  leftCmd = left;
+  rightCmd = right;
+
+  digitalWrite(LEFT_DIR, left < 0 ? HIGH : LOW);
+  digitalWrite(RIGHT_DIR, right < 0 ? HIGH : LOW);
+
+  analogWrite(LEFT_PWM, (int)(fabsf(left) * 255));
+  analogWrite(RIGHT_PWM, (int)(fabsf(right) * 255));
+}
+
+// Differential steering
+void calculateSteering(float &left, float &right) {
+  float leftVelocity =
+      forwardSpeed - (turnRate * TRACK_WIDTH / 2.0f);
+
+  float rightVelocity =
+      forwardSpeed + (turnRate * TRACK_WIDTH / 2.0f);
+
+  left = constrain(leftVelocity / MAX_SPEED,
+                   -1.0f, 1.0f);
+
+  right = constrain(rightVelocity / MAX_SPEED,
+                    -1.0f, 1.0f);
+}
+
+void fastControl(unsigned long now) {
+  int adc = analogRead(CURRENT_PIN);
+  currentA = (adc / 4095.0f) * 30.0f;
+
+  // Continuous overcurrent detection
+  if (state == NORMAL) {
+    if (currentA > 20.0f) {
+      if (!highCurrent) {
+        highCurrent = true;
+        highCurrentStart = now;
+      }
+
+      if (now - highCurrentStart >= STALL_TIME) {
+        state = POWER_REDUCED;
+        stateStart = now;
+        digitalWrite(WARNING_LED, HIGH);
+        Serial.println("STALL ACTIVE");
+      }
+    } else {
+      highCurrent = false;
+    }
+  }
+
+  float left, right;
+  calculateSteering(left, right);
+
+  switch (state) {
+    case NORMAL:
+      setMotors(left, right);
+      break;
+
+    case POWER_REDUCED:
+      // Limit motor output to 20%
+      setMotors(constrain(left, -0.2f, 0.2f),
+                constrain(right, -0.2f, 0.2f));
+
+      if (now - stateStart >= POWER_REDUCE_TIME) {
+        state = REVERSING;
+        stateStart = now;
+        Serial.println("RECOVERY: REVERSING");
+      }
+      break;
+
+    case REVERSING:
+      // Short reverse pulse for both motors
+      setMotors(-0.2f, -0.2f);
+
+      if (now - stateStart >= REVERSE_TIME) {
+        state = LOCKOUT;
+        setMotors(0, 0);
+        Serial.println("RECOVERY ENDED: MOTORS STOPPED");
+      }
+      break;
+
+    case LOCKOUT:
+      setMotors(0, 0);
+      break;
+  }
+}
+
+// Parse commands without blocking loop execution
+void readCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      inputLine.trim();
+
+      if (inputLine == "r") {
+        if (state == LOCKOUT && currentA < 10.0f) {
+          state = NORMAL;
+          highCurrent = false;
+          digitalWrite(WARNING_LED, LOW);
+          Serial.println("RESET SUCCESSFUL");
+        } else {
+          Serial.println("RESET DENIED");
+        }
+      } else {
+        float v, w;
+
+        if (sscanf(inputLine.c_str(), "%f %f", &v, &w) == 2) {
+          forwardSpeed = constrain(v, -1.0f, 1.0f);
+          turnRate = constrain(w, -2.0f, 2.0f);
+          Serial.println("COMMAND ACCEPTED");
+        } else if (inputLine.length() > 0) {
+          Serial.println("INVALID COMMAND");
+        }
+      }
+
+      inputLine = "";
+    } else if (inputLine.length() < 63) {
+      inputLine += c;
+    }
+  }
+}
+
+const char* stateName() {
+  switch (state) {
+    case NORMAL: return "NORMAL";
+    case POWER_REDUCED: return "POWER_REDUCED";
+    case REVERSING: return "REVERSING";
+    case LOCKOUT: return "LOCKOUT";
+  }
+  return "UNKNOWN";
+}
+
+void slowCommunication() {
+  readCommands();
+
+  Serial.print("Current: ");
+  Serial.print(currentA, 1);
+  Serial.print("A | Left: ");
+  Serial.print(leftCmd, 2);
+  Serial.print(" | Right: ");
+  Serial.print(rightCmd, 2);
+  Serial.print(" | State: ");
+  Serial.print(stateName());
+
+  if (state == NORMAL && currentA > 15.0f) {
+    Serial.print(" | WARNING: HIGH CURRENT");
+  }
+
+  Serial.println();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(CURRENT_PIN, INPUT);
+  pinMode(LEFT_PWM, OUTPUT);
+  pinMode(RIGHT_PWM, OUTPUT);
+  pinMode(LEFT_DIR, OUTPUT);
+  pinMode(RIGHT_DIR, OUTPUT);
+  pinMode(WARNING_LED, OUTPUT);
+
+  analogReadResolution(12);
+  digitalWrite(WARNING_LED, LOW);
+
+  setMotors(0, 0);
+
+  Serial.println("ACE ROBOTICS - SANDSTORM TRAVERSE");
+  Serial.println("Commands: speed turnRate");
+  Serial.println("Example: 0.5 0.0");
+  Serial.println("Reset lockout: r");
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (now - lastFast >= FAST_PERIOD) {
+    lastFast = now;
+    fastControl(now);
+  }
+
+  if (now - lastSlow >= SLOW_PERIOD) {
+    lastSlow = now;
+    slowCommunication();
+  }
+}
